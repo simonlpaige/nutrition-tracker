@@ -1,0 +1,26 @@
+// Exercises the real UI handlers and rendered markup with a small DOM adapter.
+// This is not a browser layout test or an Android integration test.
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const vm=require('node:vm');
+const fs=require('node:fs');
+const path=require('node:path');
+const C=require('../app/src/main/assets/core.js');
+const app=fs.readFileSync(path.join(__dirname,'../app/src/main/assets/app.js'),'utf8');
+function harness(initial,failSave=false){
+ const nodes=new Map(),store=new Map();if(initial)store.set('daily-rhythm-v1',JSON.stringify(initial));
+ function element(name){if(!nodes.has(name))nodes.set(name,{innerHTML:'',textContent:'',hidden:false,value:'',listeners:{},dataset:{},classList:{toggle(){}},setAttribute(){},addEventListener(n,f){this.listeners[n]=f;},showModal(){this.open=true;},close(){this.open=false;},click(){}});return nodes.get(name);}
+ const nav=['today','journal','trends','settings'].map(k=>({...element('nav-'+k),dataset:{tab:k}}));
+ const window={RhythmCore:C,scrollTo(){}};
+ const context={window,RhythmCore:C,document:{querySelector:element,querySelectorAll:()=>nav,createElement:element},localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>{if(failSave)throw Error('Storage is full');store.set(k,v);}},setTimeout(){return 0;},clearTimeout(){},console,Date,FormData:class{constructor(form){this.data=form.fields;}get(k){return this.data[k]??null;}},TextEncoder,Blob,URL};
+ vm.runInNewContext(app,context);
+ return {element,store,window,click(action,extras={}){element('#main').listeners.click({target:{closest:()=>({dataset:{action,...extras}})}});},nav(tab){element('nav').onclick({target:{closest:()=>({dataset:{tab}})}});},submit(fields){element('#entry-form').onsubmit({preventDefault(){},target:{fields}});},read(){return JSON.parse(store.get('daily-rhythm-v1'));}};
+}
+function fields(overrides={}){const date=new Date(Date.now()-120000),at=C.dayOf(date)+'T'+String(date.getHours()).padStart(2,'0')+':'+String(date.getMinutes()).padStart(2,'0');return {at,name:'Oatmeal',category:'Breakfast',portion:'1 bowl',servings:'2',calories:'250',protein:'10',carbs:'35',fat:'8',fiber:'5',sugar:'',sodium:'',notes:'Breakfast after walk',...overrides};}
+test('meal form saves, updates totals, and keeps a reloadable journal',()=>{const h=harness();h.click('meal');h.submit(fields());assert.equal(h.read().meals.length,1);assert.match(h.element('#main').innerHTML,/500/);const next=harness(h.read());assert.match(next.element('#main').innerHTML,/Oatmeal/);assert.match(next.element('#main').innerHTML,/500/);});
+test('edit replaces an entry, repeat adds a new one, deletion requires confirmation',()=>{const h=harness();h.click('meal');h.submit(fields());const id=h.read().meals[0].id;h.click('edit',{id,kind:'meals'});h.submit(fields({servings:'1'}));assert.equal(h.read().meals.length,1);assert.equal(h.read().meals[0].servings,1);h.click('repeat',{id});h.submit(fields({servings:'1'}));assert.equal(h.read().meals.length,2);h.click('delete',{id,kind:'meals'});assert.equal(h.read().meals.length,2);h.element('#confirm-ok').onclick();assert.equal(h.read().meals.length,1);});
+test('bowel form saves the time, consistency, urgency, color and discomfort',()=>{const h=harness();h.click('no-bowel');assert.equal(h.read().noBowel.length,1);h.click('stool');h.submit(fields({type:'6',pain:'3',ease:'Difficult',urgency:'Strong',color:'Yellow',notes:'After lunch'}));assert.equal(h.read().stools[0].type,6);assert.equal(h.read().stools[0].pain,3);assert.equal(h.read().stools[0].color,'Yellow');assert.deepEqual(h.read().noBowel,[]);assert.match(h.element('#main').innerHTML,/Bristol type 6/);});
+test('meal text is escaped in the journal and edit form',()=>{const h=harness();h.click('meal');h.submit(fields({name:'<img src=x onerror=alert(1)>',notes:'<script>bad()</script>'}));assert.doesNotMatch(h.element('#main').innerHTML,/<img src=x/);assert.match(h.element('#main').innerHTML,/&lt;img/);h.click('edit',{kind:'meals',id:h.read().meals[0].id});assert.doesNotMatch(h.element('#editor-body').innerHTML,/<script>bad/);});
+test('storage failure leaves the editor open and does not claim a save',()=>{const h=harness(null,true);h.click('meal');h.submit(fields());assert.equal(h.element('#editor').open,true);assert.match(h.element('#toast').textContent,/Storage is full/);assert.equal(h.store.size,0);});
+test('all navigation screens render and preview does not show fake health values',()=>{const h=harness();assert.match(h.element('#health-grid').innerHTML,/Android app required/);h.nav('journal');assert.match(h.element('#main').innerHTML,/Recorded days/);h.nav('trends');assert.match(h.element('#main').innerHTML,/Bristol types/);h.nav('settings');assert.match(h.element('#main').innerHTML,/Connect Health Connect/);assert.match(h.element('#main').innerHTML,/disabled/);});
+test('import rejects corrupt backups and requires confirmation before replacing data',()=>{const h=harness();h.click('meal');h.submit(fields());h.window.RhythmEvent('import',{text:'not json'});assert.equal(h.read().meals.length,1);h.window.RhythmEvent('import',{text:JSON.stringify(C.empty())});assert.equal(h.read().meals.length,1);h.element('#confirm-ok').onclick();assert.equal(h.read().meals.length,0);});

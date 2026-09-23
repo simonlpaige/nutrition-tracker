@@ -1,0 +1,8 @@
+Daily Rhythm 0.4.0
+37 JavaScript tests passed; 2 FIT importer tests passed.
+Android assembleDebug and lintDebug passed, 0 lint errors.
+Installed in place on Pixel 9 Pro; READ_SLEEP and notifications remained granted.
+Native 14-day review read 14 days of sleep and 14 sleep sessions.
+Official Garmin FIT SDK decoded 102 valid samples and 3 activity summaries.
+USB companion transferred sanitized import to the app; helper running.
+No real data submitted to ChatGPT during testing.

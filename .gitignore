@@ -1,0 +1,14 @@
+.gradle/
+**/build/
+**/.venv/
+**/__pycache__/
+local.properties
+*.apk
+*.zip
+*.jks
+*.keystore
+companion/backup-config.json
+companion/cloud-upload.json
+companion/backup-status.json
+companion/*.log
+garmin-cache/
