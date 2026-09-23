@@ -25,8 +25,7 @@ public class MainActivity extends Activity {
     private WebView web;
     private HealthReader health;
     private HealthArchive healthArchive;
-    private AtomicFile journal;
-    private final Object journalLock = new Object();
+    private LoggingRepository repository;
     private String pendingExport;
     private boolean ready;
     private int reviewGeneration;
@@ -36,7 +35,7 @@ public class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         
-        journal = new AtomicFile(new File(getFilesDir(), "journal.json"));
+        repository = new LoggingRepository(this);
         health = new HealthReader(this);
         healthArchive=new HealthArchive(this);
         web = new WebView(this);
@@ -102,26 +101,11 @@ public class MainActivity extends Activity {
         event("message",o);
     }
     public class Bridge {
-        @JavascriptInterface public String load() {
-            synchronized(journalLock) {
-                try { return new String(journal.readFully(),StandardCharsets.UTF_8); }
-                catch(FileNotFoundException e) { return "null"; }
-                catch(Exception e) { return "{\"loadError\":true}"; }
-            }
-        }
+        @JavascriptInterface public String load() { return repository.load(); }
         @JavascriptInterface public String save(String data) {
-            synchronized(journalLock) {
-                FileOutputStream stream = null;
-                try {
-                    byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
-                    if(bytes.length>MAX_BYTES) return "Journal is too large. Export a backup before removing older entries.";
-                    JSONObject parsed = new JSONObject(data);
-                    if(parsed.getInt("version")!=1 || !(parsed.get("meals") instanceof JSONArray) || !(parsed.get("stools") instanceof JSONArray)) return "Invalid journal.";
-                    stream=journal.startWrite(); stream.write(bytes); journal.finishWrite(stream);
-                    updateReviewPreference(parsed);
-                    return "";
-                } catch(Exception e) { if(stream!=null) journal.failWrite(stream); return "Could not save. Your previous journal is intact."; }
-            }
+            String error=repository.save(data);
+            if(error.isEmpty())try {updateReviewPreference(new JSONObject(data));}catch(JSONException ignored){}
+            return error;
         }
         @JavascriptInterface public String loadGarmin() {
             try {
