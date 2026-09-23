@@ -7,37 +7,29 @@ import android.content.pm.PackageManager;
 import android.graphics.Insets;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.PersistableBundle;
 import android.provider.Settings;
-import android.util.AtomicFile;
 import android.view.*;
 import android.webkit.*;
 import android.widget.FrameLayout;
 import org.json.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.time.*;
 import java.util.Map;
 
 public class MainActivity extends Activity {
     private WebView web;
-    private HealthReader health;
-    private HealthArchive healthArchive;
+    private HealthSyncManager health;
     private LoggingRepository repository;
     private String pendingExport;
     private boolean ready;
-    private int reviewGeneration;
-    private final Handler reviewHandler = new Handler(Looper.getMainLooper());
     private static final int MAX_BYTES = 8 * 1024 * 1024;
     private static final String ORIGIN = "https://appassets.androidplatform.net/";
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         
         repository = new LoggingRepository(this);
-        health = new HealthReader(this);
-        healthArchive=new HealthArchive(this);
+        health = new HealthSyncManager(this, repository, this::event);
         web = new WebView(this);
         web.setBackgroundColor(0xff191525);
         FrameLayout content = new FrameLayout(this);
@@ -69,25 +61,25 @@ public class MainActivity extends Activity {
             @Override public void onPageFinished(WebView view,String url) { ready=true; event("nativeStatus", status()); event("refreshHealth",new JSONObject()); }
         });
         setContentView(content); content.requestApplyInsets(); web.loadUrl(ORIGIN+"index.html");
-        ReminderReceiver.schedule(this);
+        ReminderScheduler.schedule(this);
     }
     // Do not put health journal/export payloads in saved instance state (Binder size limit).
     @Override protected void onSaveInstanceState(Bundle out) { super.onSaveInstanceState(out); }
     @Override public void onRequestPermissionsResult(int code,String[] permissions,int[] results) {
         super.onRequestPermissionsResult(code,permissions,results);
-        if (code==101 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==PackageManager.PERMISSION_GRANTED) ReminderReceiver.enable(this,true);
+        if (code==101 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==PackageManager.PERMISSION_GRANTED) ReminderScheduler.enable(this,true);
         event("nativeStatus",status());
-        if(code==100){healthArchive.capture();event("refreshHealth",new JSONObject());}
+        if(code==100){health.capture();event("refreshHealth",new JSONObject());}
     }
     @Override protected void onResume() {
         super.onResume();
-        if(healthArchive!=null)healthArchive.capture();
-        if(web!=null && ready) { ReminderReceiver.schedule(this); event("nativeStatus",status()); event("refreshHealth",new JSONObject()); }
+        if(health!=null)health.capture();
+        if(web!=null && ready) { ReminderScheduler.schedule(this); event("nativeStatus",status()); event("refreshHealth",new JSONObject()); }
     }
     private JSONObject status() {
         JSONObject o=new JSONObject();
         try {
-            o.put("native",true).put("reminder",ReminderReceiver.enabled(this))
+            o.put("native",true).put("reminder",ReminderScheduler.enabled(this))
              .put("notifications",getSystemService(NotificationManager.class).areNotificationsEnabled())
              .put("exact",getSystemService(AlarmManager.class).canScheduleExactAlarms());
         } catch(JSONException ignored) { }
@@ -104,7 +96,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface public String load() { return repository.load(); }
         @JavascriptInterface public String save(String data) {
             String error=repository.save(data);
-            if(error.isEmpty())try {updateReviewPreference(new JSONObject(data));}catch(JSONException ignored){}
+            if(error.isEmpty())try {ReminderScheduler.updateReviewPreference(MainActivity.this,new JSONObject(data));}catch(JSONException ignored){}
             return error;
         }
         @JavascriptInterface public String loadGarmin() {
@@ -125,21 +117,8 @@ public class MainActivity extends Activity {
         @JavascriptInterface public String getStatus() { return status().toString(); }
         @JavascriptInterface public void connect() { runOnUiThread(() -> { try { health.requestPermissions(); } catch(Exception e) {message("Health Connect permissions could not open. Try Android Settings → Health Connect.");} }); }
         @JavascriptInterface public void sync(String date) { runOnUiThread(() -> health.readDay(date,data -> event("health",data))); }
-        @JavascriptInterface public void syncRange(int days,String end) { runOnUiThread(() -> {
-            try {
-                LocalDate date=LocalDate.parse(end);
-                if((days!=14&&days!=28)||date.isAfter(LocalDate.now()))throw new IllegalArgumentException();
-                int generation=++reviewGeneration;
-                final boolean[] started={false};
-                Runnable begin=() -> {if(started[0]||generation!=reviewGeneration||isDestroyed())return;started[0]=true;readReviewDay(date,days,0,generation);};
-                reviewHandler.postDelayed(begin,15000);
-                health.readSleepRange(date.minusDays(days-1),date,data -> {
-                    if(started[0]||generation!=reviewGeneration||isDestroyed())return;
-                    event("reviewSleep",data);reviewHandler.removeCallbacks(begin);begin.run();
-                });
-            } catch(Exception e) { reviewError("Choose a 14- or 28-day window ending today or earlier."); }
-        }); }
-        @JavascriptInterface public void cancelReview() { runOnUiThread(() -> reviewGeneration++); }
+        @JavascriptInterface public void syncRange(int days,String end) { runOnUiThread(() -> health.readReview(days,end)); }
+        @JavascriptInterface public void cancelReview() { runOnUiThread(() -> health.cancelReview()); }
         @JavascriptInterface public String copyAI(String text) {
             if(text==null||text.length()>180000)return "This prompt is too large. Try a 14-day review.";
             runOnUiThread(() -> {
@@ -165,7 +144,7 @@ public class MainActivity extends Activity {
         }); }
         @JavascriptInterface public void reminder(boolean enabled) { runOnUiThread(() -> {
             if(enabled && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED) requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},101);
-            else ReminderReceiver.enable(MainActivity.this,enabled);
+            else ReminderScheduler.enable(MainActivity.this,enabled);
             event("nativeStatus",status());
         }); }
         @JavascriptInterface public void privacy() { runOnUiThread(() -> startActivity(new Intent(MainActivity.this,PrivacyActivity.class))); }
@@ -201,37 +180,5 @@ public class MainActivity extends Activity {
             } catch(Exception e){message("Could not read this backup. Choose a JSON backup under 8 MB.");}
         }
     }
-    private void updateReviewPreference(JSONObject data) {
-        JSONObject ai=data.optJSONObject("ai");
-        if(ai==null)return;
-        int interval=ai.optInt("reviewEveryDays",14);
-        if(interval!=0&&interval!=7&&interval!=14&&interval!=28)return;
-        getSharedPreferences("reminder",0).edit().putInt("reviewDays",interval)
-            .putString("lastReview",ai.isNull("lastReviewDay")?"":ai.optString("lastReviewDay","")).apply();
-    }
-    private void reviewError(String message) {
-        JSONObject o=new JSONObject();try{o.put("message",message);}catch(JSONException ignored){}
-        event("reviewError",o);
-    }
-    private void readReviewDay(LocalDate end,int days,int index,int generation) {
-        if(generation!=reviewGeneration||isDestroyed())return;
-        if(index==days){reviewProgress(days,days);return;}
-        final int[] received={0};final boolean[] finished={false};
-        Runnable advance=() -> {
-            if(finished[0]||generation!=reviewGeneration||isDestroyed())return;
-            finished[0]=true;reviewProgress(index+1,days);
-            if(index+1<days)reviewHandler.postDelayed(() -> readReviewDay(end,days,index+1,generation),160);
-        };
-        reviewHandler.postDelayed(advance,15000);
-        health.readDay(end.minusDays(days-1-index).toString(),data -> {
-            if(finished[0]||generation!=reviewGeneration||isDestroyed())return;
-            event("reviewHealth",data);
-            if(++received[0]==10){reviewHandler.removeCallbacks(advance);advance.run();}
-        });
-    }
-    private void reviewProgress(int completed,int total) {
-        JSONObject o=new JSONObject();try{o.put("completed",completed).put("total",total);}catch(JSONException ignored){}
-        event("reviewProgress",o);
-    }
-    @Override protected void onDestroy(){reviewGeneration++;reviewHandler.removeCallbacksAndMessages(null);if(web!=null){web.removeJavascriptInterface("RhythmAndroid");web.destroy();web=null;}super.onDestroy();}
+    @Override protected void onDestroy(){if(health!=null)health.close();if(web!=null){web.removeJavascriptInterface("RhythmAndroid");web.destroy();web=null;}super.onDestroy();}
 }
