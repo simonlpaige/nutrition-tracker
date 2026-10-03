@@ -7,6 +7,7 @@ import org.json.*;
 /** Owns reminder timing and saved preferences; the receiver only delivers notifications. */
 public final class ReminderScheduler {
     static final String ACTION="com.simon.dailyrhythm.CHECK_IN";
+    static final String FOREGROUND="com.simon.dailyrhythm.OPEN_CHECK_IN";
     private static PendingIntent pending(Context c) {
         return PendingIntent.getBroadcast(c, 20, new Intent(c, ReminderReceiver.class).setAction(ACTION), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }

@@ -10,7 +10,17 @@ def verify(path):
    if sha(z.read(name))!=digest:raise ValueError('Backup checksum mismatch: '+name)
   journal=json.loads(z.read('phone/files/journal.json'))
   if journal.get('version')!=1 or not isinstance(journal.get('meals'),list):raise ValueError('Invalid journal in backup')
+  if 'phone/files/journal-export-status.json' in z.namelist():
+   export=json.loads(z.read('phone/files/journal-export-status.json'))
+   if not export.get('valid') or export.get('sha256')!=sha(z.read('phone/files/journal.json')):raise ValueError('Room journal export is pending or stale; reopen the app before backing up')
+  if any(Path(n).name=='ai_secure.xml' for n in z.namelist()):raise ValueError('API credential storage must not be backed up')
  return manifest
+
+def phone(adb):
+ devices=subprocess.check_output([adb,'devices'],text=True)
+ serials=[line.split('\t')[0] for line in devices.splitlines() if line.endswith('\tdevice') and not line.startswith('emulator-')]
+ if len(serials)!=1:raise ValueError('Waiting for one authorized USB Android phone for backup')
+ return [adb,'-s',serials[0]]
 
 def snapshot(adb,cache,destination,cloud=None,force=False):
  destination=Path(destination);destination.mkdir(parents=True,exist_ok=True)
@@ -18,15 +28,14 @@ def snapshot(adb,cache,destination,cloud=None,force=False):
  if marker.exists() and not force:
   last=json.loads(marker.read_text(encoding='utf-8'))
   if (now-dt.datetime.fromisoformat(last['createdAt'])).total_seconds()<3600:return last
- devices=subprocess.check_output([adb,'devices'],text=True)
- if sum(line.endswith('\tdevice') for line in devices.splitlines())!=1:raise ValueError('Waiting for one authorized Android phone for backup')
- raw=subprocess.check_output([adb,'exec-out','run-as','com.simon.dailyrhythm','tar','-cf','-','files','shared_prefs'])
+ command=phone(adb)
+ raw=subprocess.check_output(command+['exec-out','run-as','com.simon.dailyrhythm','tar','-cf','-','files','shared_prefs'])
  members={}
  with tarfile.open(fileobj=io.BytesIO(raw)) as t:
   for m in t.getmembers():
    path=Path(m.name)
    if not m.isfile() or path.is_absolute() or '..' in path.parts:continue
-   if path.name=='backup-status.json' or path.suffix in ['.pending','.tmp','.new']:continue
+   if path.name in ['backup-status.json','ai_secure.xml'] or path.suffix in ['.pending','.tmp','.new']:continue
    members['phone/'+m.name]=t.extractfile(m).read()
  for p in Path(cache).rglob('*'):
   if p.is_file() and (p.suffix.lower()=='.fit' or p.name=='garmin-fit.json'):
@@ -56,7 +65,12 @@ if __name__=='__main__':
  cfg=json.loads(Path(args.config).read_text(encoding='utf-8-sig'))
  try:
   result=snapshot(cfg['adb'],cfg['cache'],cfg['local'],cfg.get('cloud'),args.force)
- except Exception as exc:result={'localVerified':False,'error':str(exc)}
+ except Exception as exc:
+  result={'localVerified':False,'error':str(exc)}
+  try:
+   latest=json.loads((Path(cfg['local'])/'latest.json').read_text(encoding='utf-8'))
+   verify(latest['localPath']);result={**latest,'error':str(exc),'captureStatus':'waiting_or_failed'}
+  except Exception:pass
  ledger=Path(args.config).parent/'cloud-upload.json'
  if cfg.get('driveFolderId') and result.get('localVerified'):
   result['cloudStatus']='pending_drive_upload'
@@ -67,9 +81,10 @@ if __name__=='__main__':
     result.update(cloudStatus='drive_verified',cloudUrl=cloud.get('url'))
  output=Path(args.config).parent/'backup-status.json';output.write_text(json.dumps(result),encoding='utf-8')
  try:
-  subprocess.run([cfg['adb'],'push',str(output),'/data/local/tmp/rhythm-backup-status.json'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-  subprocess.run([cfg['adb'],'shell','run-as','com.simon.dailyrhythm','cp','/data/local/tmp/rhythm-backup-status.json','files/backup-status.pending'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-  subprocess.run([cfg['adb'],'shell','run-as','com.simon.dailyrhythm','mv','files/backup-status.pending','files/backup-status.json'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-  subprocess.run([cfg['adb'],'shell','rm','/data/local/tmp/rhythm-backup-status.json'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  command=phone(cfg['adb'])
+  subprocess.run(command+['push',str(output),'/data/local/tmp/rhythm-backup-status.json'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  subprocess.run(command+['shell','run-as','com.simon.dailyrhythm','cp','/data/local/tmp/rhythm-backup-status.json','files/backup-status.pending'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  subprocess.run(command+['shell','run-as','com.simon.dailyrhythm','mv','files/backup-status.pending','files/backup-status.json'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  subprocess.run(command+['shell','rm','/data/local/tmp/rhythm-backup-status.json'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  except Exception:pass
  print(json.dumps(result))

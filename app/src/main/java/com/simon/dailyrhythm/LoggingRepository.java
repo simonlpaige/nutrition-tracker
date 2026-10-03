@@ -16,6 +16,7 @@ public final class LoggingRepository {
     private final RhythmDatabase database;
     private final AtomicFile journal;
     private final File original;
+    private final AtomicFile exportStatus;
     static final int MAX_BYTES=8*1024*1024;
 
     public LoggingRepository(Context context) {
@@ -25,9 +26,10 @@ public final class LoggingRepository {
         }
         journal=new AtomicFile(new File(context.getFilesDir(),"journal.json"));
         original=new File(context.getFilesDir(),"journal.pre-room.json");
+        exportStatus=new AtomicFile(new File(context.getFilesDir(),"journal-export-status.json"));
     }
     LoggingRepository(RhythmDatabase db,File folder) {
-        database=db;journal=new AtomicFile(new File(folder,"journal.json"));original=new File(folder,"journal.pre-room.json");
+        database=db;journal=new AtomicFile(new File(folder,"journal.json"));original=new File(folder,"journal.pre-room.json");exportStatus=new AtomicFile(new File(folder,"journal-export-status.json"));
     }
     public String load() {
         synchronized(LOCK) {
@@ -45,7 +47,7 @@ public final class LoggingRepository {
                 database.runInTransaction(()->store(raw,entries));
                 write(new AtomicFile(new File(original.getParentFile(),"room-migration.json")),
                     new JSONObject().put("status","verified").put("entries",entries.size()).put("sha256",digest(raw)).put("at",java.time.Instant.now().toString()).toString());
-                return raw;
+                mirror(raw);return raw;
             } catch(Exception e) {return "{\"loadError\":true}";}
         }
     }
@@ -63,6 +65,7 @@ public final class LoggingRepository {
         }
     }
     private void store(String raw,List<JournalEntry> entries) {
+        try{write(exportStatus,"{\"valid\":false}");}catch(IOException e){throw new IllegalStateException("Cannot mark portable export pending",e);}
         JournalDao dao=database.journal();JournalSnapshot previous=dao.snapshot();
         dao.clearEntries();dao.insertEntries(entries);
         List<JournalEntry> copied=dao.entries();
@@ -73,7 +76,7 @@ public final class LoggingRepository {
         JournalSnapshot snapshot=new JournalSnapshot();snapshot.raw=raw;snapshot.sha256=digest(raw);snapshot.revision=previous==null?1:previous.revision+1;dao.snapshot(snapshot);
     }
     private void mirror(String raw) {
-        try {write(journal,raw);}catch(IOException ignored){/* Room remains authoritative; next load retries export. */}
+        try {write(journal,raw);write(exportStatus,"{\"valid\":true,\"sha256\":\""+digest(raw)+"\"}");}catch(IOException ignored){/* Room remains authoritative; pending marker prevents a stale backup being verified. */}
     }
     private static void write(AtomicFile file,String raw)throws IOException {
         FileOutputStream out=null;

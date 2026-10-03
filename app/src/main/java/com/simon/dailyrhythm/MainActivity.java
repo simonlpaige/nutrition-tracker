@@ -21,6 +21,9 @@ public class MainActivity extends Activity {
     private WebView web;
     private HealthSyncManager health;
     private LoggingRepository repository;
+    private MealEstimator meals;
+    private boolean pendingCheckIn, pendingWeekly;
+    private final BroadcastReceiver checkInReceiver=new BroadcastReceiver(){@Override public void onReceive(Context c,Intent i){pendingCheckIn=true;pendingWeekly=i.getBooleanExtra("weekly",false);showCheckIn();}};
     private String pendingExport;
     private boolean ready;
     private static final int MAX_BYTES = 8 * 1024 * 1024;
@@ -30,6 +33,8 @@ public class MainActivity extends Activity {
         
         repository = new LoggingRepository(this);
         health = new HealthSyncManager(this, repository, this::event);
+        meals = new MealEstimator(this,this::event);
+        readCheckInIntent(getIntent());
         web = new WebView(this);
         web.setBackgroundColor(0xff191525);
         FrameLayout content = new FrameLayout(this);
@@ -49,7 +54,7 @@ public class MainActivity extends Activity {
         web.setWebViewClient(new WebViewClient() {
             @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
                 String url = req.getUrl().toString();
-                Map<String,String> files = Map.of("index.html","text/html","style.css","text/css","theme.css","text/css","core.js","text/javascript","app.js","text/javascript","ai-core.js","text/javascript","assist.js","text/javascript","body-core.js","text/javascript","body.js","text/javascript","garmin.js","text/javascript");
+                Map<String,String> files = Map.ofEntries(Map.entry("index.html","text/html"),Map.entry("style.css","text/css"),Map.entry("theme.css","text/css"),Map.entry("core.js","text/javascript"),Map.entry("app.js","text/javascript"),Map.entry("ai-core.js","text/javascript"),Map.entry("assist.js","text/javascript"),Map.entry("body-core.js","text/javascript"),Map.entry("body.js","text/javascript"),Map.entry("garmin.js","text/javascript"),Map.entry("nutrition.js","text/javascript"));
                 String name = url.startsWith(ORIGIN) ? url.substring(ORIGIN.length()) : "";
                 if (files.containsKey(name)) {
                     try { return new WebResourceResponse(files.get(name),"UTF-8",getAssets().open(name)); }
@@ -58,7 +63,7 @@ public class MainActivity extends Activity {
                 return new WebResourceResponse("text/plain","UTF-8",403,"Blocked",Map.of(),new ByteArrayInputStream(new byte[0]));
             }
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) { return true; }
-            @Override public void onPageFinished(WebView view,String url) { ready=true; event("nativeStatus", status()); event("refreshHealth",new JSONObject()); }
+            @Override public void onPageFinished(WebView view,String url) { ready=true; event("nativeStatus", status()); event("refreshHealth",new JSONObject()); showCheckIn(); }
         });
         setContentView(content); content.requestApplyInsets(); web.loadUrl(ORIGIN+"index.html");
         ReminderScheduler.schedule(this);
@@ -73,9 +78,15 @@ public class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume();
+        registerReceiver(checkInReceiver,new IntentFilter(ReminderScheduler.FOREGROUND),Context.RECEIVER_NOT_EXPORTED);
         if(health!=null)health.capture();
         if(web!=null && ready) { ReminderScheduler.schedule(this); event("nativeStatus",status()); event("refreshHealth",new JSONObject()); }
+        showCheckIn();
     }
+    @Override protected void onPause(){try{unregisterReceiver(checkInReceiver);}catch(IllegalArgumentException ignored){}super.onPause();}
+    @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);readCheckInIntent(intent);showCheckIn();}
+    private void readCheckInIntent(Intent intent){if(intent!=null&&intent.getBooleanExtra("checkIn",false)){pendingCheckIn=true;pendingWeekly=intent.getBooleanExtra("weekly",false);intent.removeExtra("checkIn");}}
+    private void showCheckIn(){if(!ready||!pendingCheckIn)return;pendingCheckIn=false;try{event("checkIn",new JSONObject().put("weekly",pendingWeekly));}catch(JSONException ignored){}}
     private JSONObject status() {
         JSONObject o=new JSONObject();
         try {
@@ -115,18 +126,25 @@ public class MainActivity extends Activity {
             try{return new String(java.nio.file.Files.readAllBytes(new File(getFilesDir(),"backup-status.json").toPath()),StandardCharsets.UTF_8);}catch(Exception e){return "null";}
         }
         @JavascriptInterface public String getStatus() { return status().toString(); }
+        @JavascriptInterface public String cachedHealth(){return health.cached();}
+        @JavascriptInterface public String nutritionStatus(){return meals.status().toString();}
+        @JavascriptInterface public String configureNutrition(String key,boolean enabled){return meals.configure(key,enabled);}
+        @JavascriptInterface public void clearNutrition(){meals.clear();}
+        @JavascriptInterface public void estimateNutrition(String meal){meals.estimate(meal);}
+        @JavascriptInterface public String pendingNutrition(){return meals.pending();}
+        @JavascriptInterface public void acknowledgeNutrition(String id){meals.acknowledge(id);}
         @JavascriptInterface public void connect() { runOnUiThread(() -> { try { health.requestPermissions(); } catch(Exception e) {message("Health Connect permissions could not open. Try Android Settings → Health Connect.");} }); }
         @JavascriptInterface public void sync(String date) { runOnUiThread(() -> health.readDay(date,data -> event("health",data))); }
         @JavascriptInterface public void syncRange(int days,String end) { runOnUiThread(() -> health.readReview(days,end)); }
         @JavascriptInterface public void cancelReview() { runOnUiThread(() -> health.cancelReview()); }
         @JavascriptInterface public String copyAI(String text) {
-            if(text==null||text.length()>180000)return "This prompt is too large. Try a 14-day review.";
+            if(text==null||text.length()>400000)return "This prompt is too large. Choose a shorter review window.";
             runOnUiThread(() -> {
                 ClipData clip=ClipData.newPlainText("Daily Rhythm AI prompt",text);
                 PersistableBundle extras=new PersistableBundle();extras.putBoolean("android.content.extra.IS_SENSITIVE",true);
                 clip.getDescription().setExtras(extras);
-                getSystemService(ClipboardManager.class).setPrimaryClip(clip);
-                message("Prompt copied. Paste it into ChatGPT when ready.");
+                try{getSystemService(ClipboardManager.class).setPrimaryClip(clip);message("Prompt copied. Paste it into ChatGPT when ready.");}
+                catch(Exception e){message("This prompt could not fit on the clipboard. Choose a shorter review window.");}
             });
             return "";
         }
@@ -180,5 +198,5 @@ public class MainActivity extends Activity {
             } catch(Exception e){message("Could not read this backup. Choose a JSON backup under 8 MB.");}
         }
     }
-    @Override protected void onDestroy(){if(health!=null)health.close();if(web!=null){web.removeJavascriptInterface("RhythmAndroid");web.destroy();web=null;}super.onDestroy();}
+    @Override protected void onDestroy(){if(health!=null)health.close();if(meals!=null)meals.close();if(web!=null){web.removeJavascriptInterface("RhythmAndroid");web.destroy();web=null;}super.onDestroy();}
 }
